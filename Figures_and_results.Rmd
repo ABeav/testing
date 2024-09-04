@@ -1,0 +1,1932 @@
+---
+title: "Figures and results"
+author: "Alex Beaver"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+mail: "abeaver3@jhmi.edu"
+twitter: "ABeavR"
+github: "ABeav"
+output:
+  html_document:
+    css: RmdResources/style.css
+    includes:
+      after_body: RmdResources/footer.html
+    code_folding: hide
+    theme: flatly
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    fig_caption: True
+    df_print: kable
+editor_options:
+  chunk_output_type: inline
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(devtools)
+library(ggpubr)
+library(grid)
+library(scales)
+library(AICcmodavg)
+library(rstatix)
+library(ggprism)
+```
+
+```{r, Functions, echo=FALSE}
+# Functions created and used later for this analysis.
+vsg_read <- function(filename, samplename = TRUE) {
+  if (stringr::str_detect(filename, ".txt") != TRUE) {
+    warning("This does not look like a VSGSeq results file.")
+  }
+  filename <- readr::read_tsv( filename ) %>%
+    dplyr::filter( file != "file") %>%
+    dplyr::mutate( Percent = readr::parse_number(Percent),
+            RPKM = readr::parse_number(RPKM),
+            dplyr::across(pct_id_vs_query:assembled_VSG_length, readr::parse_number)) 
+  if ( samplename == TRUE ) {
+    tidyr::separate(filename, file, "samplename", sep = ".fq", convert = TRUE) 
+  } else {
+    return(filename)
+  }
+}
+
+vsg_distinct_vectorize <- function(df, ...) {
+  df %>%
+    dplyr::distinct(...)
+}
+
+vsg_expand <- function(df, col1, col2, merge = TRUE) {
+  col1 <- as.name(col1)
+  col2 <- as.name(col2)
+
+  samples <- df %>%
+    vsgseqtools::vsg_distinct_vectorize(df[col1])
+  clusters <- df %>%
+    vsgseqtools::vsg_distinct_vectorize(df[col2])
+
+  expanded <- tidyr::expand_grid(samples, clusters)
+
+  if (merge == TRUE) {
+    expanded %>%
+      dplyr::left_join(df) %>%
+      dplyr::mutate(Percent = tidyr::replace_na(Percent, 0))
+  } else {
+    expanded
+  }
+}
+
+vsg_rename <- function(vsg_results_df, cluster_reference, ref_header = FALSE) {
+  if (exists(cluster_reference) != TRUE) {
+    cluster_reference <- utils::read.delim(cluster_reference,
+                                    header= ref_header)
+    colnames(cluster_reference) = c('VSG','cluster')
+    dplyr::left_join(vsg_results_df, cluster_reference)
+  } else {
+    colnames(cluster_reference) = c('VSG','cluster')
+    dplyr::left_join(vsg_results_df, cluster_reference)
+  }
+}
+
+vsg_count <- function( df, ..., keep_all = FALSE) {
+  if (keep_all == FALSE) {
+    df %>%
+      dplyr::group_by(...) %>%
+      dplyr::count() %>%
+      dplyr::rename( vsg_count = n ) %>%
+      dplyr::ungroup()
+  } else {
+    df %>%
+      dplyr::group_by(...) %>%
+      dplyr::add_count() %>%
+      dplyr::rename( vsg_count = n ) %>%
+      dplyr::ungroup()
+  }
+}
+
+vsg_max <- function(df,...) {
+  df %>%
+    dplyr::group_by(...) %>%
+    dplyr::filter(Percent == max(Percent)) %>%
+    dplyr::ungroup()
+}
+
+equation <- function(x) {
+  lm_coef <- list(a = round(coef(x)[1], digits = 2),
+                  b = round(coef(x)[2], digits = 2),
+                  r2 = round(summary(x)$r.squared, digits = 2));
+  lm_eq <- substitute(italic(y) == a + b %.% italic(x)*","~~italic(R)^2~"="~r2,lm_coef)
+  as.character(as.expression(lm_eq));                 
+}
+
+tissue_parasitemia_predictor <- function(file_location, file_name, standard_parasite_numbers, file_for_sample_multipliers) {
+  
+  results <- clean_qPCR_files_check_NTC(file_location, 
+                                        file_name, 
+                                        undetermined = "remove") %>%
+    separate(sample_name, c("mouse", "day", "tissue"), 
+             sep = " ", remove = FALSE) %>%
+    mutate(tissue = replace_na(tissue, "standard"))
+  
+  samples <- results %>% 
+  filter(tissue != "standard") %>%
+  group_by(sample_name,mouse, day, tissue) %>%
+  summarise(ct_mean = mean(ct))
+  
+  standards <- results %>%
+  filter(tissue == "standard") %>%
+  group_by(sample_name) %>%
+  summarise(ct_mean = mean(ct))
+  
+  standard_parasite_numbers <- read_csv(standard_parasite_numbers)
+  
+  standards <- left_join(standards, standard_parasite_numbers)
+  
+  fit <- lm(log10(parasites) ~ ct_mean, data = standards)
+  
+  predictions <- predict(fit, newdata = samples, interval = "prediction") %>%
+    as.tibble() %>%
+    select(fit)
+  
+tissue_sample_multipliers <- read.csv(file_for_sample_multipliers) %>%
+  mutate(mouse = str_c("m", mouse),
+         day = str_c("d", day),
+         tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon Fat" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub Cu" ~ "sc",
+                            TRUE ~ tissue)) %>%
+  mutate(sample_name = str_c(mouse, day, tissue, sep = " ")) %>%
+  select(sample_name, multiplier.to.reprent.full.sample, Mass..mg.) %>%
+  rename(mass = Mass..mg.)
+
+  predictions <- cbind(predictions, newdata = samples) %>%
+    mutate(number_of_parasites = 10^fit) %>%
+    rename(ct_mean = newdata.ct_mean,
+           sample_name = newdata.sample_name) %>%
+    select(sample_name, ct_mean, number_of_parasites) 
+  
+  predictions <- left_join(predictions, tissue_sample_multipliers) %>%
+    mutate(total_parasites_in_sample =
+             number_of_parasites*multiplier.to.reprent.full.sample) %>%
+    mutate(parasites_per_mg = total_parasites_in_sample/mass)
+  
+  return(list(predictions,standards))
+  
+}
+
+blood_parasitemia_predictor <- function(file_location, file_name,
+                                        standard_parasite_numbers,
+                                        file_for_sample_multipliers) {
+  
+  results <- clean_qPCR_files_check_NTC(file_location, 
+                                        file_name, 
+                                        undetermined = "remove") %>% 
+    separate(sample_name, c("mouse", "day", "tissue"), 
+             sep = " ", remove = FALSE) %>%
+    mutate(tissue = replace_na(tissue, "standard"))
+  
+  samples <- results %>% 
+  filter(tissue != "standard") %>%
+  group_by(sample_name,mouse, day, tissue) %>%
+  summarise(ct_mean = mean(ct))
+  
+  standards <- results %>%
+  filter(tissue == "standard") %>%
+  group_by(sample_name) %>%
+  summarise(ct_mean = mean(ct)) %>%
+    filter(sample_name != "std 7")
+  
+  standard_parasite_numbers <- read_csv(standard_parasite_numbers)
+  
+  standards <- left_join(standards, standard_parasite_numbers)
+  
+  fit <- lm(log10(parasites) ~ ct_mean, data = standards)
+  
+  predictions <- predict(fit, newdata = samples, interval = "prediction") %>%
+    as.tibble() %>%
+    select(fit)
+  
+tissue_sample_multipliers <- read.csv(file_for_sample_multipliers) %>%
+  mutate(mouse = str_c("m", mouse),
+         day = str_c("d", day),
+         tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon Fat" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub Cu" ~ "sc",
+                            TRUE ~ tissue)) %>%
+  mutate(sample_name = str_c(mouse, day, tissue, sep = " ")) %>%
+  select(sample_name, multiplier.to.reprent.full.sample, Mass..mg., parasitemia_count) %>%
+  rename(mass = Mass..mg.)
+
+  predictions <- cbind(predictions, newdata = samples) %>%
+    mutate(number_of_parasites = 10^fit) %>%
+    rename(ct_mean = newdata.ct_mean,
+           sample_name = newdata.sample_name) %>%
+    select(sample_name, ct_mean, number_of_parasites) 
+  
+  predictions <- left_join(predictions, tissue_sample_multipliers) %>%
+    mutate(total_parasites_in_sample =
+             number_of_parasites*multiplier.to.reprent.full.sample) %>%
+    mutate(parasites_per_mg = total_parasites_in_sample/mass) %>%
+    mutate(parasites_per_ml = parasites_per_mg*1000) %>%
+    mutate(fold_difference = parasitemia_count/parasites_per_ml) %>%
+    mutate(parasites_in_sample_by_count = parasitemia_count*.025)
+
+  return(list(predictions,standards))
+  
+}
+```
+
+```{r, echo=F}
+# mouse sets
+day6_mice_IV_wt <- c("M12", "M27", "M32", "M33")
+day6_mice <- c(1,2,3,4)
+day10_mice_IV_wt <- c("M30", "M36", "M4", "M6")
+day10_mice <- c(5,6,7,8)
+day14_mice_IV_wt <- c("M2", "M34", "M35", 'M3')
+day14_mice <- c(9,10,11,12)
+IV_wt_set_numbers <- c(12,27,32,33,30,36,4,6,2,3,34,35)
+mouse_names <- tibble(mouse = list("M12","M27", "M32", "M33", "M30", "M36", "M4", "M6", "M2", "M34","M35", "M3"),
+                      mouse_final = 1:12)
+
+# color palettes 
+color_palette_12 <- c("#BA584A","#3D7F9F","#4D947B","#FAD370","#8BD9D1","#F59E75","#B0889E",
+                      "#F28A2E","#AB7846","#A2BDA5","#F09EB0","#D9D9D9")
+color_palette_11 <- c("#BA584A","#3D7F9F","#A2BDA5","#FAC46E","#8BD9D1","#E0AA8D","#B0889E",
+                      "#AB7846","#4D947B","#F28A2E","#D9D9D9")
+color_palette_3 <- c("#BA584A","#A2BDA5","#3D7F9F")
+color_palette_4 <- c("#BA584A","#A2BDA5","#3D7F9F", "#B0889E")
+color_palette_3_v2 <- c("#BA584A","#4D947B","#8BD9D1")
+color_palette_2 <- c("#BA584A","#3D7F9F")
+red_blue <- c("#BA584A", "#095786")
+```
+
+
+# Reading and tidying data
+
+```{r}
+# VSG seq results
+vsg_seq_results <- read_csv("data/Beaver_raw_vsg_seq_results_WT.csv")
+
+# Sequencing alignment data
+alignment_data <- read_csv("data/Beaver_VSG_seq_alignment_data.csv")
+
+# parasitemia count data
+parasitemia <- read_csv("data/parasitemia.csv") %>%
+  mutate(mouse = as.character(mouse))
+```
+
+## Analzying and tidying tissue parasitemia qPCR data
+
+```{r}
+# need my qpcr cleaner package (this is specific to the output of out qpcr machine)
+#install_github("ABeav/qPCRr")
+library(qPCRr)
+
+# loading in each raw data frame 
+parasitemia_5 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/", "abex7_parasitemia_5.xls", undetermined = "remove")
+
+parasitemia_6 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/", "abex7_parasitemia_6.xls", undetermined = "remove")
+
+parasitemia_7 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/", "abex7_parasitemia_7.xls", undetermined = "remove")
+
+parasitemia_8 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                            "abex7_parasitemia_8.xls",
+                                            undetermined = "remove")
+
+parasitemia_9 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                            "abex7_parasitemia_9.xls",
+                                            undetermined = "remove")
+
+parasitemia_11 <- clean_qPCR_files_check_NTC("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                            "abex7_parasitemia_11.xls",
+                                            undetermined = "remove")
+
+predict_5 <- tissue_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                              "abex7_parasitemia_5.xls",
+                                    "data/parasite_load_qpcr_data/parasite_standard_numbers.csv",
+                                    "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_5 <- predict_5[[1]]
+standards_5 <- predict_5[[2]] %>%
+  mutate(exp = "5")
+
+predict_6 <- tissue_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                              "abex7_parasitemia_6.xls",
+                                    "data/parasite_load_qpcr_data/parasite_standard_numbers.csv",
+                                    "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_6 <- predict_6[[1]]
+standards_6 <- predict_6[[2]] %>%
+  mutate(exp = "6")
+
+predict_7 <- tissue_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                              "abex7_parasitemia_7.xls",
+                                  "data/parasite_load_qpcr_data/parasite_standard_numbers.csv",
+                                    "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_7 <- predict_7[[1]]
+standards_7 <- predict_7[[2]] %>%
+  mutate(exp = "7")
+
+predict_8 <- blood_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                            "abex7_parasitemia_8.xls",
+                                  "data/parasite_load_qpcr_data/parasite_standard_numbers.csv",
+                                  "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_8 <- predict_8[[1]]
+standards_8 <- predict_8[[2]] %>%
+  mutate(exp = "8")
+
+predict_9 <- blood_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                             "abex7_parasitemia_9.xls",
+                                    "data/parasite_load_qpcr_data/parasite_standard_numbers.csv",
+                                    "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_9 <- predict_9[[1]]
+standards_9 <- predict_9[[2]] %>%
+  mutate(exp = "9")
+
+# There is no parasitemia_10 because it didnt work very well so I redid those samples to make parasitemia_11
+
+predict_11 <- blood_parasitemia_predictor("data/parasite_load_qpcr_data/raw_qpcr_data/",
+                                            "abex7_parasitemia_11.xls",
+                                            "data/parasite_load_qpcr_data/parasite_standard_numbers.csv", 
+                                            "data/parasite_load_qpcr_data/tissue_sample_multipliers.csv")
+predictions_11 <- predict_11[[1]]
+standards_11 <- predict_11[[2]] %>%
+  mutate(exp = "11")
+
+# Tidy up the data frames and concatenate them 
+tissue_predictions <- rbind(predictions_5, predictions_6, predictions_7) %>%
+  separate(sample_name, c("mouse", "day", "tissue"), 
+             sep = " ", remove = FALSE) 
+
+replacement_samples <- predictions_11$sample_name
+
+blood_predictions <- rbind(predictions_8, predictions_9) %>% 
+  filter(!sample_name %in% replacement_samples) %>%
+  rbind(predictions_11) %>%
+  separate(sample_name, c("mouse", "day", "tissue"), 
+             sep = " ", remove = FALSE) 
+
+all_predictions <- full_join(tissue_predictions, blood_predictions)
+```
+#
+```{r}
+parasitemia_data = parasitemia %>% 
+  mutate(mouse = as.character(mouse)) %>%
+  mutate(mouse = factor(mouse, levels = c("12", "27" ,"32", "33","30", "36", "4","6",
+                                        "2","34","35","3","16","45","13","15","42","40",
+                                        "23"))) %>%
+  mutate(mouse_final = case_when(mouse == "12" ~ "1", 
+                                 mouse == "27" ~ "2",
+                                 mouse == "32" ~ "3",
+                                 mouse == "33" ~ "4",
+                                 mouse == "30" ~ "5",
+                                 mouse == "36" ~ "6",
+                                 mouse == "4" ~ "7",
+                                 mouse == "6" ~ "8",
+                                 mouse == "2" ~ "9",
+                                 mouse == "34" ~ "10",
+                                 mouse == "35" ~ "11",
+                                 mouse == "3" ~ "12")) %>%
+  mutate(mouse = as.character(mouse)) %>%
+  filter(group == "IV") %>% 
+  filter(!is.na(mouse_final) ) %>%
+  mutate(mouse_final = as.numeric(mouse_final)) 
+parasitemia_data$parasitemia = as.numeric(parasitemia_data$parasitemia)
+parasitemia_data$parasitemia = parasitemia_data$parasitemia %>% 
+    replace_na(100000)
+
+write_csv(parasitemia_data, "source_data/ext_dat_3a.csv")
+
+parasitemia_data_plot <- parasitemia_data %>%
+  ggplot(aes(x = day, y = parasitemia))+
+  geom_point(stat = "identity", size = 1)+
+  geom_line(size = .5)+
+  theme_pubr()+
+  labs(color = "Mouse")+
+  facet_wrap(vars(mouse_final), nrow = 3, ncol = 4) +
+  scale_x_continuous(breaks = c(4,6,8,10,12,14)) +
+  theme(panel.grid.major.y = element_line(linetype = 1, color = "grey")) +
+  scale_y_log10(labels = trans_format("log10", math_format(10^.x)))
+
+parasitemia_data_plot
+
+ggsave("figures/parasitemia.pdf",parasitemia_data_plot,
+       device = "pdf", width = 6, height = 4, units = "in")
+```
+
+
+
+## Supplementary figure 1b 
+```{r}
+# Supplementary figure 1b 
+tissue_parasite_load_dat  <- all_predictions %>%
+  mutate(mouse = factor(mouse, levels = c("m12", "m27","m32","m33","m30","m36",
+                                          "m4","m6","m2","m3","m34","m35"))) %>%
+  mutate(parasites_per_gram = parasites_per_mg*1000) %>%
+  group_by(tissue, day) %>%
+  summarize(mean = mean(parasites_per_gram), 
+            stderr= sd(parasites_per_gram),
+            parasites_per_gram=parasites_per_gram,
+            mass = mass,
+            total_parasites_in_sample = total_parasites_in_sample, 
+            parasites_per_mg = parasites_per_mg, 
+            parasitemia_count = parasitemia_count,
+            mouse=mouse, ct_mean = ct_mean) %>%
+  mutate(day = case_when(day == "d6" ~ 6, 
+                         day == "d10" ~ 10,
+                         day == "d14" ~ 14)) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sc" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+  mutate(mass_of_organ = mass) %>%
+  mutate(mass_of_organ = case_when(tissue == "blood" ~ 1500, 
+                                   tissue == "ear" ~ 2730,
+                                   TRUE ~ mass_of_organ)) %>%
+  mutate(parasites_per_organ = mass_of_organ*parasites_per_mg)
+  
+Supplementary_figure_1b <- tissue_parasite_load_dat %>%
+  filter(tissue != "blood") %>%
+  ggplot(aes(x= day, y= parasites_per_gram)) +
+  geom_boxplot(aes(y= parasites_per_gram, group = day)) +
+  geom_point(aes(y = parasites_per_gram), size = 1) +
+  theme(axis.text.x = element_text(color = "black", angle = 45, hjust = 1)) +
+  scale_y_log10(breaks = c(10^4,10^5,10^6,10^7,10^8, 10^9),
+                limits= c(10^4, 10^9),
+                labels = trans_format("log10", math_format(10^.x))) +
+  facet_grid(~tissue_final, scales = "free_x") +
+  theme_pubr() +
+  ylab("Parasites per gram of tissue") +
+  scale_x_continuous(breaks = c(6,10,14)) +
+  theme(panel.grid.major.y = element_line(linetype = 1, color = "grey")) +
+  xlab("Time post infection (days)") 
+
+Supplementary_figure_1b
+
+#ggsave("Supplementary_figure_1b.pdf",Supplementary_figure_1b,
+#       device = "pdf", width = 6, height = 4, units = "in")
+
+#write.csv(all_predictions, "parasitemia_predictions.csv")
+```
+
+```{r}
+total_parasite_load_graph <- tissue_parasite_load_dat %>%
+  ggplot(aes(x= day, y= parasites_per_organ)) +
+  geom_boxplot(aes(y= parasites_per_organ, group = day)) +
+  geom_point(aes(y = parasites_per_organ), size = 1) +
+  theme(axis.text.x = element_text(color = "black", angle = 45, hjust = 1)) +
+  scale_y_log10(breaks = c(10^3,10^4,10^5,10^6,10^7,10^8, 10^9),
+                limits= c(10^3, 10^9.5),
+                labels = trans_format("log10", math_format(10^.x))) +
+  facet_grid(~tissue_final, scales = "free_x") +
+  theme_pubr() +
+  ylab("Total parasite load") +
+  scale_x_continuous(breaks = c(6,10,14)) +
+  theme(panel.grid.major.y = element_line(linetype = 1, color = "grey")) +
+  xlab("Time post infection (days)") 
+
+total_parasite_load_graph
+
+ggsave("figures/figure_S1c.pdf",total_parasite_load_graph,
+       device = "pdf", width = 6, height = 4, units = "in")
+```
+
+
+## Supplementary figure 1c 
+```{r}
+
+plate_list <- tibble(plate = 1:6, exp = c("5", "6", "7", "8", "9", "11"))
+
+all_standards <- rbind(standards_5, standards_6, standards_7, 
+                       standards_8, standards_9, standards_11) %>%
+  left_join(plate_list)
+
+all_standards_graph <- all_standards %>%
+  mutate(plate = as.character(plate)) %>%
+  ggplot(aes(x = log10(parasites), y = ct_mean, color = plate)) + 
+  geom_line() +
+  geom_point() +
+  theme_pubr(legend = "right", base_size = 22) +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "*`,`~")),
+           label.x.npc = "middle") +
+  scale_color_manual(values = color_palette_12) +
+  geom_smooth(method = "lm", se = F) 
+ 
+all_standards_graph
+
+ggsave("figures/figure_S1d.pdf", all_standards_graph,
+      device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+```{r}
+# Cleaned tissue parasite load data (qPCR)
+parasite_load_qPCR <- read_csv("data/parasite_load_qpcr_data/parasite_load_qPCR.csv")
+```
+
+```{r}
+# Tidying tissue names to be consistent and renaming VSGs to cluster names
+vsg_seq_results_tidy <- vsg_rename(vsg_seq_results, 
+                                   "data/cluster_reference_table.txt") %>% 
+  mutate(tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub" ~ "sub",
+                            tissue == "gonfat" ~ "gon",
+                            tissue == "subcu" ~ "sub", 
+                            tissue == "lungs" ~ "lung",
+                            tissue == "GonFat" ~ "gon", 
+                            tissue == "SubCu" ~ "sub",
+                            TRUE ~ tissue)) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+  select(-...1)
+
+# Filtering VSGs that represented less than 0.01% of parasites in a sample
+results <-  vsg_seq_results_tidy %>%
+  filter(Percent > 0.01) %>% 
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) %>%
+  group_by(samplename) %>%
+  distinct(cluster, .keep_all = TRUE) %>%
+  ungroup()
+
+# Getting rid of samples with less than 100,000 reads aligning
+bad_alignment <- alignment_data %>%
+  filter(reads_aligned < 100000)
+
+results <- anti_join( results, bad_alignment, by = c("mouse", "tissue"))
+
+# Filter VSGs that represent less than 1 parasite based on Percentage and parasitemia data
+parasite_numbers <- parasite_load_qPCR %>% 
+  mutate(tissue = case_when(tissue == "sc" ~ "sub", TRUE ~ tissue)) %>%
+  mutate(day = str_to_upper(day),
+         mouse = str_to_upper(mouse)) %>%
+  select(mouse,day,tissue, total_parasites_in_sample)
+
+results <- left_join(results, parasite_numbers) %>%
+  mutate(parasites = (Percent/100)*total_parasites_in_sample)
+
+vsgs_tossed_from_parasitemia<- results %>%
+  filter(parasites < 1) %>%
+  group_by(samplename) %>%
+  dplyr::count()
+
+results <- results %>%
+  filter(parasites > 1 | is.na(parasites) == TRUE)
+
+# Tidying and giving mice new figure names (1-12)
+
+results <- results %>%
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) %>%
+  mutate(mouse_final = case_when(mouse == "M12" ~ "1", 
+                                 mouse == "M27" ~ "2",
+                                 mouse == "M32" ~ "3",
+                                 mouse == "M33" ~ "4",
+                                 mouse == "M30" ~ "5",
+                                 mouse == "M36" ~ "6",
+                                 mouse == "M4" ~ "7",
+                                 mouse == "M6" ~ "8",
+                                 mouse == "M2" ~ "9",
+                                 mouse == "M34" ~ "10",
+                                 mouse == "M35" ~ "11",
+                                 mouse == "M3" ~ "12")) %>%
+  mutate(mouse_final = as.numeric(mouse_final))
+
+# Need one data frame with all VSGs represented in each space even if its not detected there for plotting purposes. 
+results_all_combos <- vsg_expand(vsg_seq_results_tidy, "samplename", "cluster") %>%
+  separate(samplename, c("mouse", "day", "tissue"), sep = "_", remove = FALSE) %>%
+   mutate(tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub" ~ "sub",
+                            tissue == "gonfat" ~ "gon",
+                            tissue == "subcu" ~ "sub", 
+                            tissue == "lungs" ~ "lung",
+                            tissue == "GonFat" ~ "gon", 
+                            tissue == "SubCu" ~ "sub",
+                            TRUE ~ tissue)) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+  anti_join(bad_alignment, by = c("mouse", "tissue"))
+
+```
+
+# Main figures
+
+## Figure 1
+
+#### A 
+```{r}
+top_11_VSGs <- results %>% 
+  select(day, tissue, cluster, Percent) %>%
+  select(-tissue, -day) %>%
+  group_by(cluster) %>%
+  summarize(sum = max(Percent)) %>%
+  slice_max(sum, n = 11) %>%
+  mutate(color = cluster,
+         top_11_whole = "top") 
+
+top_VSGs <- results %>% 
+  filter(day == "D14" ) %>%
+  select(day, tissue, cluster, parasites) %>%
+  select(-tissue, -day) %>%
+  group_by(cluster) %>%
+  summarize(parasites_sum = sum(parasites, na.rm = TRUE)) %>%
+  slice_max(parasites_sum, n = 40) 
+
+common_D14_eatro1125_vsgs <- top_VSGs %>%
+  left_join(results) %>%
+  ungroup() %>%
+  group_by(cluster) %>%
+  filter(assembled_VSG_length == max(assembled_VSG_length)) %>%
+  filter(pct_id_vs_match == max(pct_id_vs_match)) %>%
+  select(cluster, hit_VSG, pct_id_vs_match, pct_id_vs_query, parasites_sum) %>%
+  ungroup() %>%
+  distinct() %>%
+  filter(pct_id_vs_query > 90) %>%
+  filter(pct_id_vs_match > 90) %>%
+  group_by(hit_VSG) %>%
+  filter(pct_id_vs_query == max(pct_id_vs_query)) %>%
+  distinct() %>%
+  mutate(hit_VSG = fct_reorder(hit_VSG, parasites_sum, .desc = T))
+  
+  #mutate(color = cluster,
+   #      top_11_whole = "top") 
+  
+#write_csv(common_D14_eatro1125_vsgs, "common_D14_eatro1125_vsgs.csv")
+
+stacked_bar_plot_dat <- results %>%
+  mutate(mouse = factor(mouse, levels = c("M12","M27", "M32", 
+                                          "M33", "M30", "M36", 
+                                          "M4", "M6", "M2",  
+                                          "M34", "M35", "M3" ))) %>%
+  left_join(top_11_VSGs) %>%
+  mutate(color = case_when(is.na(color) == TRUE ~ "other",
+                            TRUE ~ color )) %>%
+  mutate(day_tis = case_when(tissue_final == "blood" ~ str_c(day, tissue_final, sep = " "), 
+                             TRUE ~ tissue_final)) %>%
+  mutate(day_tis = factor(day_tis, levels = c("D6 blood", "D10 blood", "D14 blood",
+                                              "brain","skin","gon. fat","heart","lung","s.c. fat"))) %>%
+  mutate(color = paste("VSG", color, sep = " "), 
+         color = case_when( color == "VSG Cluster 56" ~ "AnTat1.1",
+                              color == "VSG Cluster 1830" ~ "VSG-421",
+                              TRUE ~ color)) %>%
+  mutate(color = fct_reorder(color, sum , .desc = TRUE, .na_rm = F),
+         color = fct_relevel(color, "VSG Cluster 294", after = 2), 
+         mouse_final_2 = paste("Mouse", mouse_final, sep = " "),
+         mouse_final_2 = fct_reorder(mouse_final_2, mouse_final)) %>% 
+  group_by(mouse_final_2, day, tissue_final) %>%
+  mutate(percent_final = (Percent/sum(Percent))*100)
+
+stacked_bar_plot <- stacked_bar_plot_dat %>%
+  ggplot(aes(x = day_tis, y = percent_final, fill = color)) +
+  geom_col(color = "black") +
+  facet_wrap("mouse_final_2", nrow = 3) + 
+  theme_pubr(legend = "right", base_size =20) +
+  theme(axis.text.x = element_text(angle = 90, size = 8)) +
+  scale_fill_manual(values = color_palette_12) +
+  xlab("") +
+  ylab("Percent of expression")
+stacked_bar_plot 
+
+#ggsave("figures/figure_1A.pdf", stacked_bar_plot,
+#       device = "pdf", width = 10, height = 6, units = "in")
+```
+### B 
+
+```{r}
+D10_mouse_VSG_counts <- results %>%
+  filter(mouse_final == "5" | mouse_final == "6" | mouse_final == "7" | mouse_final == "8",
+         day == "D10") %>%
+  mutate(space = case_when(tissue == 'blood' ~ 'blood only', TRUE ~ 'tissues only')) %>%
+  group_by(space) %>%
+  distinct(cluster, mouse_final, day) %>%
+  ungroup() %>%
+  group_by(mouse_final, cluster) %>%
+  add_tally() %>%
+  mutate(space = case_when(n == 2 ~ 'shared', TRUE ~ space)) %>%
+  ungroup() %>% 
+  group_by(mouse_final, space) %>%
+  distinct(cluster, space) %>%
+  dplyr::count(name = "VSGs",sort = TRUE) %>%
+  ungroup() %>%
+  group_by(mouse_final) %>%
+  mutate(total_vsgs = sum(VSGs)) %>%
+  ungroup() %>%
+  mutate(day = "Day 10")
+
+D6_mouse_VSG_counts <- results %>%
+  filter(mouse_final == "1" | mouse_final == "2" | mouse_final == "3" 
+         | mouse_final == "4") %>% 
+  mutate(space = case_when(tissue == 'blood' ~ 'blood only', TRUE ~ 'tissues only')) %>%
+  group_by(space) %>%
+  distinct(cluster, mouse_final, day) %>%
+  ungroup() %>%
+  group_by(mouse_final, cluster) %>%
+  add_tally() %>%
+  mutate(space = case_when(n == 2 ~ 'shared', TRUE ~ space)) %>%
+  ungroup() %>% 
+  group_by(mouse_final, space) %>%
+  distinct(cluster, space) %>%
+  dplyr:::count(name = "VSGs",sort = TRUE) %>%
+  ungroup() %>%
+  group_by(mouse_final) %>%
+  mutate(total_vsgs = sum(VSGs)) %>%
+  ungroup() %>%
+  mutate(day = "Day 6")
+
+D14_mouse_VSG_counts <- results %>%
+  filter(mouse_final == "9" | mouse_final == "10" | mouse_final == "11" | mouse_final == "12",
+         day == "D14") %>%
+  mutate(space = case_when(tissue == 'blood' ~ 'blood only', TRUE ~ 'tissues only')) %>%
+  group_by(space) %>%
+  distinct(cluster, mouse_final, day) %>%
+  ungroup() %>%
+  group_by(mouse_final, cluster) %>%
+  add_tally() %>%
+  mutate(space = case_when(n == 2 ~ 'shared', TRUE ~ space)) %>%
+  ungroup() %>% 
+  group_by(mouse_final, space) %>%
+  distinct(cluster, space) %>%
+  dplyr::count(name = "VSGs",sort = TRUE) %>%
+  ungroup() %>%
+  group_by(mouse_final) %>%
+  mutate(total_vsgs = sum(VSGs)) %>%
+  ungroup() %>%
+  mutate(day = "Day 14")
+
+mouse_VSGs_count <- D6_mouse_VSG_counts %>%
+  bind_rows(D10_mouse_VSG_counts, D14_mouse_VSG_counts) %>%
+  mutate(mouse_final = as.character(mouse_final)) %>%
+  mutate(
+         day = factor(day, levels = c("Day 6", "Day 10", "Day 14")),
+         percent_vsgs = (VSGs/total_vsgs)*100) %>%
+  mutate(mouse_final = as.numeric(mouse_final))
+
+mouse_VSGs_count_summary <- mouse_VSGs_count %>%
+  ungroup() %>%
+  group_by(space, mouse_final) %>%
+  summarize(mean(percent_vsgs))
+
+mouse_VSGs_count_plot <- mouse_VSGs_count %>%
+  ggplot(aes(x = mouse_final, y = percent_vsgs))+
+  geom_col(aes(fill = space))+
+  facet_wrap("day", scales = "free_x") + 
+  ylab("Percent of VSGs") + 
+  xlab("Mouse") +
+  theme_pubr(base_size = 20) +
+  theme(legend.position = "top") +
+  scale_fill_manual(values = color_palette_3)
+
+mouse_VSGs_count_plot
+
+ggsave("figures/figure_1B.pdf", mouse_VSGs_count_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+### C
+
+```{r}
+counts_per_sample <- results %>%
+  vsg_count(day, mouse_final, tissue_final) %>%
+  mutate(space = case_when(tissue_final != "blood" ~ "tissues", 
+                           TRUE ~ tissue_final)) 
+
+test_of_normality <- counts_per_sample %>% 
+  group_by(day) %>% 
+  shapiro_test(vsg_count)
+
+counts_by_space_t_test_dat <- counts_per_sample %>% 
+  group_by(day) %>%
+  pairwise_t_test(vsg_count ~ space, p.adjust.method = "BH") %>%
+  add_xy_position(x = "day", dodge = 0.75)
+
+counts_by_space_plot <- counts_per_sample %>%
+  ggplot(aes(x = day, y = vsg_count, group = interaction(day, space))) + 
+  geom_boxplot(aes(fill = space), alpha = .5, width =.75) +
+  geom_point(aes(color = space),size = 2.5, position = position_jitterdodge(.1)) + 
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Number of VSGs") +
+  scale_fill_manual(values = color_palette_12) +
+  scale_color_manual(values = color_palette_12) +
+  add_pvalue(counts_by_space_t_test_dat, 
+             label = "p.adj.signif",
+             xmin = "xmin", 
+             xmax = "xmax") +
+  scale_y_continuous(limits = c(0,350))
+counts_by_space_plot
+
+ggsave("figures/figure_1C.pdf", counts_by_space_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+### D
+
+```{r}
+counts_by_sample_dunn_test<- counts_per_sample %>%
+  group_by(day) %>%
+  dunn_test(vsg_count ~ tissue_final, p.adjust.method = "BH" ) %>%
+  add_xy_position(step.increase = 0.05)
+
+counts_by_sample_norm_test <- counts_per_sample %>%
+  mutate(test_tissue = paste(day, tissue_final, sep = "_")) %>%
+  filter(test_tissue != "D10_brain") %>%
+  select(-test_tissue) %>%
+  group_by(day, tissue_final) %>%
+  shapiro_test(vsg_count)
+
+counts_by_sample_boxplot <- results %>%
+  filter(mode == "IV",
+         strain == "WT") %>%
+  vsg_count(day, mouse, tissue_final) %>%
+  ggplot(aes(x = tissue_final, y = vsg_count)) + 
+  facet_wrap( vars(day))  +
+  geom_boxplot(outlier.size = 0) +
+  geom_dotplot(binaxis='y', stackdir= "center", stackratio = .8, dotsize=.32) +
+  xlab("") +
+  ylab("Number of VSGs") +
+  theme_pubr(base_size = 20) +
+  theme(axis.text.x = element_text(angle = 90,
+                                 hjust = 1, 
+                                 size = 12, 
+                                 color = 'black'),
+        legend.position = "right") +
+  stat_pvalue_manual(counts_by_sample_dunn_test, 
+             label = "p.adj",
+             xmin = "xmin", 
+             xmax = "xmax", 
+             hide.ns = TRUE,
+             size = 3.8, 
+             tip.length = 0.02,
+             bracket.nudge.y = -30)
+counts_by_sample_boxplot
+
+ggsave("figures/figure_1D.pdf", counts_by_sample_boxplot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+```{r}
+formula <- y ~ x
+
+mouse_names <- mouse_names %>%
+  mutate(mouse = unlist(mouse))
+
+alignment_data_2 <- alignment_data %>%
+  filter(mouse %in% mouse_names$mouse) %>%
+  mutate(mouse = as.character(mouse)) %>%
+  left_join(mouse_names)
+
+reads_vs_VSGS <- alignment_data_2 %>% 
+  select(reads_aligned, mouse_final, day ,tissue_final) %>%
+  left_join(counts_per_sample) %>%
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) 
+
+write_csv(reads_vs_VSGS, "source_data/ext_dat_4a.csv")
+
+reads_vs_VSGS_plot <- reads_vs_VSGS %>%
+  ggplot(aes(x = reads_aligned, y = vsg_count)) +
+  geom_point(aes()) + 
+  geom_smooth( method='lm', color = "black", size = .5)+
+  stat_regline_equation(label.y = 450, aes(label = ..rr.label..)) +
+  theme_pubr()
+
+reads_vs_VSGS_plot 
+```
+```{r}
+day6_mice_IV_wt <- c("M12", "M27", "M32", "M33")
+day10_mice_IV_wt <- c("M30", "M36", "M4", "M6")
+day14_mice_IV_wt <- c("M2", "M34", "M35", 'M3')
+wt_set <- c(day6_mice_IV_wt, day10_mice_IV_wt, day14_mice_IV_wt)
+
+vsgs_vs_parasites <- results %>%
+  filter(mouse %in% wt_set, 
+         !is.na(total_parasites_in_sample)) %>%
+  group_by(mouse, day, tissue, total_parasites_in_sample) %>%
+  count(name = "total_vsgs") 
+
+write_csv(vsgs_vs_parasites, "source_data/ext_dat_4b.csv")
+
+vsgs_vs_parasites_plot <- vsgs_vs_parasites %>%
+  ggplot(aes(x = log10(total_parasites_in_sample), y = total_vsgs)) +
+  geom_point() + 
+  geom_smooth( method='lm', color = "black", size = .5)+
+  stat_regline_equation(label.y = 450, aes(label = ..rr.label..), formula = y~x) +
+  theme_pubr()
+vsgs_vs_parasites_plot
+
+ggsave("figures/vsgs_vs_parasites.pdf",vsgs_vs_parasites_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+## Figure 2
+
+### B
+
+```{r}
+vsg_percent_unique <- results %>%
+  select(cluster, mouse_final, day, tissue_final) %>%
+  group_by(mouse_final, cluster) %>%
+  add_tally() %>%
+  filter(n == 1) %>% 
+  group_by(mouse_final, day, tissue_final) %>%
+  dplyr::count() %>%
+  rename(number_unique = n) %>%
+  right_join(counts_per_sample) %>%
+  filter(mouse_final %in% day10_mice & day == "D10" |
+           mouse_final %in% day14_mice & day == "D14") %>%
+  mutate(percent_unique = (number_unique / vsg_count)*100,
+         ratio_unique = number_unique / vsg_count,
+         not_unique = vsg_count - number_unique)%>%
+  mutate(percent_unique= replace_na(percent_unique, 0)) 
+
+vsg_percent_unique_norm_test <- vsg_percent_unique %>%
+  mutate(test_tissue = paste(day, tissue_final, sep = "_")) %>%
+  filter(test_tissue != "D10_brain") %>%
+  select(-test_tissue) %>%
+  group_by(day, tissue_final) %>%
+  shapiro_test(percent_unique)
+
+vsg_percent_unique_t_test_dat <- vsg_percent_unique %>%
+  group_by(day) %>%
+  pairwise_t_test(percent_unique ~ tissue_final, p.adjust.method = "BH") %>%
+  add_xy_position()
+
+vsg_percent_unique_graph <- vsg_percent_unique %>% 
+  ggplot(aes(x = tissue_final, y = percent_unique)) +
+  geom_boxplot(outlier.size = 0) +
+  geom_dotplot(binaxis='y', stackdir= "center", stackratio = .8, dotsize=.4) + 
+  facet_wrap("day") +
+  xlab("") +
+  ylab("Percent of VSGs unique to only one space within each mouse") +
+  theme_pubr(base_size = 20) +
+  #scale_y_continuous(limits = c(0,100)) +
+  theme(axis.text.x = element_text(angle = 90,
+                                 hjust = 1, 
+                                 size = 12, 
+                                 color = 'black'),
+        legend.position = "right",
+        legend.background = element_rect(fill = NULL, color = NULL)) +
+ stat_pvalue_manual(vsg_percent_unique_t_test_dat, 
+             label = "p.adj.signif",
+             xmin = "xmin", 
+             xmax = "xmax", 
+             hide.ns = TRUE)
+
+vsg_percent_unique_graph
+
+ggsave("figures/figure_2B.pdf", vsg_percent_unique_graph,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+### C
+
+```{r}
+next_dominant_vsgs <- results %>%
+  filter(cluster == "Cluster 294" | cluster == "Cluster 1831" | 
+           cluster == "Cluster 504" | cluster == "Cluster 4")%>% 
+  select(mouse, cluster, mouse_final) %>%
+  merge(results_all_combos, by = c('mouse','cluster')) %>%
+  mutate(Percent = case_when(Percent < .01 ~ 0,
+                             TRUE~ Percent)) %>%
+  mutate(Percent = Percent + .001) %>%
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) %>%
+  distinct()
+
+early_cluster_vsg_expression <- next_dominant_vsgs %>%
+    mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+  filter(mouse %in% day6_mice_IV_wt & day == "D6" |
+         mouse %in% day10_mice_IV_wt & day == "D10"|
+         mouse %in% day14_mice_IV_wt & day == "D14") %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("6","10", "14"))) %>%
+  select(-day1) %>% 
+  filter(cluster != "Cluster 4") %>%
+  mutate(space = case_when(tissue == "blood" ~ "blood", 
+                           TRUE ~ "tissues"),
+         cluster = factor(cluster, levels = c("Cluster 294", "Cluster 504", 
+                                              "Cluster 1831"))) 
+
+write_csv(early_cluster_vsg_expression, "source_data/2c_source.csv")
+
+early_cluster_vsg_expression_plot <- early_cluster_vsg_expression %>%
+  ggplot(aes(x = day_num_char, y = log10(Percent),
+             group = interaction(day_num_char,space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = .75) +
+  geom_point(aes(color = tissue_final), size = 2, 
+             position = position_jitterdodge(jitter.width = .1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  facet_wrap("cluster", nrow =1, shrink = F) +
+  xlab("Time post infection (days)") +
+  ylab("Percent of parasites expressing the starting VSG") +
+  scale_color_manual(values = color_palette_12) +
+  scale_fill_manual(values = color_palette_12) +
+  scale_y_continuous(limits = c(-3,2)) +
+  geom_hline(yintercept = -2, linetype = 2) +
+  scale_y_continuous(labels = c("n.d.", "0.01%","0.1%", "1.0%", "10%", "100%")) +
+  guides(color = guide_legend(title = "Tissue"),
+         fill = guide_legend(title = "Space"))
+early_cluster_vsg_expression_plot
+
+ggsave("figures/figure_2C.pdf", early_cluster_vsg_expression_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+## Figrue 3 
+
+## A
+
+```{r}
+
+starting_vsgs <- results %>%
+  filter(day == "D6", tissue == "blood") %>%
+  vsg_max(mouse) %>% 
+  select(mouse, cluster, mouse_final) %>%
+  merge(results_all_combos, by = c('mouse','cluster')) %>%
+  mutate(Percent = case_when(Percent < .01 ~ 0,
+                             TRUE~ Percent)) %>%
+  mutate(Percent = Percent + .001) %>%
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue))
+
+starting_vsg_espression_3_dat <- starting_vsgs %>%
+  filter(mouse %in% day6_mice_IV_wt & day == "D6" |
+         mouse %in% day10_mice_IV_wt & day == "D10"|
+         mouse %in% day14_mice_IV_wt & day == "D14") %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("6","10", "14"))) %>%
+  select(-day1) %>% 
+  mutate(space = case_when(tissue == "blood" ~ "blood", 
+                           TRUE ~ "tissues")) %>%
+  mutate(expression = case_when(Percent == .001 ~ "N", 
+                                TRUE ~ "Y"),
+         day = factor(day_num, levels = c("6", "10", "14"))) 
+
+
+wilcox_test_starting_vsgs <- starting_vsg_espression_3_dat %>%
+  mutate(Percent = Percent - .001) %>%
+  group_by(day) %>%
+  pairwise_wilcox_test(Percent ~ space, p.adjust.method = "BH") %>%
+  add_xy_position() %>%
+  mutate(y.position = log10(y.position)) %>%
+  mutate(xmin = case_when(day == "6" ~ .75, 
+                          day == "10" ~ 1.75, 
+                          day == "14" ~ 2.75)) %>%
+  mutate(xmax = case_when(day == "6" ~ 1.25, 
+                          day == "10" ~ 2.25,
+                          day == "14" ~ 3.25)) %>%
+  mutate(y.position = case_when(day == "6" ~ 2.4, 
+                          day == "10" ~ 2.2,
+                          day == "14" ~ .7))
+
+write_csv(starting_vsg_espression_3_dat, "source_data/3a_source.csv")
+
+starting_vsg_espression_3 <- starting_vsg_espression_3_dat %>%
+  ggplot(aes(x = day, y = log10(Percent), group = interaction(day, space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = 1) +
+  geom_point(aes(color = tissue_final), size = 2.5, position =
+               position_jitterdodge(jitter.width = .1, dodge.width = 1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Percent of parasites\nexpressing the starting VSG") +
+  scale_color_manual(values = color_palette_12) +
+  scale_fill_manual(values = color_palette_12) +
+  stat_pvalue_manual(wilcox_test_starting_vsgs, 
+             label = "p.adj.signif",
+             xmin = "xmin", 
+             xmax = "xmax") +
+  ylim(-3,2) +
+  geom_hline(yintercept = -2, linetype = 2) +
+  scale_y_continuous(labels = c("n.d.", "0.01%","0.1%", 
+                                "1.0%", "10%", "100%", "1000%")) +
+  guides(color = guide_legend(title = "Tissue"),
+         fill = guide_legend(title = "Space"))
+starting_vsg_espression_3
+
+ggsave("figures/figure_3A.pdf", starting_vsg_espression_3,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+### B
+
+```{r}
+#Facs data
+library(sjPlot)
+
+facs_data <- read_csv("data/starting_vsg_facs_data.csv")
+
+facs_results <- facs_data %>%
+  mutate(total_parasites = antat_pos + antat_neg) %>%
+  mutate(antat_pos_ratio = antat_pos/total_parasites) %>%
+  mutate(antat_pos_percent = (antat_pos/total_parasites)*100) %>%
+  mutate(space = case_when(tissue == "blood" ~ "blood", 
+                           TRUE ~ "tissues"),
+         tissue = case_when(tissue == "fat" ~ "gon. fat",
+                            TRUE ~ tissue)) %>%
+  mutate(day = factor(day, levels = c("6", "13"))) 
+
+supplement_table_dat <- facs_results %>%
+  filter(mouse != "exp3_M5",
+           mouse != "exp3_M6",
+           mouse != "exp2_M5" ,
+           mouse != "exp2_M6") %>%
+  separate(mouse, "Biological_experiment" ,sep = "_", remove = F) %>%
+  separate(Biological_experiment, c("trash","Biological_experiment") , 
+           sep = "exp", remove = T) %>%
+  select(-trash) %>%
+  mutate(mouse_final = case_when( mouse == "exp1_C1M1" ~ "1",
+                            mouse == "exp1_C2M3" ~ "2",
+                            mouse == "exp2_M1" ~ "3", 
+                            mouse == "exp2_M2" ~ "4", 
+                            mouse == "exp2_M3" ~ "5",
+                            mouse == "exp2_M4" ~ "6",
+                            mouse == "exp3_M1" ~ "7",
+                            mouse == "exp3_M2" ~ "8",
+                            mouse == "exp3_M3" ~ "9",
+                            mouse == "exp3_M4" ~ "10")) %>%
+  mutate(mouse_final = as.numeric(mouse_final)) %>%
+  ungroup() %>%
+  select(Biological_experiment, mouse_final, 
+         tissue, day, antat_pos, antat_neg, total_parasites, antat_pos_percent) %>%
+  rename(`Biological experiment` = Biological_experiment,
+         Mouse = mouse_final,
+         Tissue = tissue,
+         `Count of AnTat1.1 + cells` = antat_pos, 
+         `Count of AnTat1.1 - cells` = antat_neg,
+         `Total number of cells` = total_parasites,
+         `Percent of cells AnTat1.1 +` = antat_pos_percent)
+  
+tab_df(supplement_table_dat, alternate.rows = T, # this colors the rows 
+       title = "Descriptive statistics", #always give #your tables #titles
+       sort.column = 2,
+       file = "figures/supplement_table_1.doc")
+
+quant_plot_dat <- facs_results %>%
+  mutate(antat_pos_percent = antat_pos_percent + .001) %>%
+  filter(mouse != "exp3_M5",
+           mouse != "exp3_M6",
+           mouse != "exp2_M5" ,
+           mouse != "exp2_M6") 
+
+write_csv(quant_plot_dat, "source_data/3b_source.csv")
+
+quant_plot_dat_pwc <- quant_plot_dat %>%
+  mutate(antat_pos_percent = antat_pos_percent - .001) %>%
+  group_by(day) %>%
+  pairwise_wilcox_test(antat_pos_percent ~ tissue, p.adjust.method = "BH") %>%
+  add_xy_position() %>%
+  mutate(y.position = log10(y.position)) %>%
+  mutate(xmin = case_when(day == "6" & group1 == "blood" ~ .6666, 
+                          day == "13" & group1 == "blood" ~ 1.666,
+                          day == "13" & group1 == "gon. fat" ~ 2)) %>%
+  mutate(xmax = case_when(day == "6" & group1== "blood" ~ 1.3333, 
+                          day == "13" & group1 == "blood" ~ 2.33333,
+                          day == "13" & group1 == "gon. fat" ~ 2.33333)) %>%
+  mutate(y.position = case_when(day == "6" ~ 2.4, 
+                          day == "13" & group1 == "blood" ~ 1.368, 
+                          day == "13" & group1 == "gon. fat" ~ 1.9))
+quant_plot_dat_pwc
+
+
+quant_plot <- quant_plot_dat %>%
+  ggplot(aes(x = day, y = log10(antat_pos_percent), group = interaction(day, tissue))) +
+  geom_boxplot(aes(fill = tissue), alpha = .5, width = 1) +
+  geom_point(aes(color = tissue), size = 2.5, 
+             position = position_jitterdodge(jitter.width = .1,dodge.width =1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Log10(Percent of parasites expressing the starting VSG)") +
+  scale_color_manual(values = color_palette_3_v2) +
+  scale_fill_manual(values = color_palette_3_v2) +
+  #scale_x_continuous(limits = c(5,14), breaks = c(6,13)) +
+  geom_hline(yintercept = -2, linetype = 2) +
+ stat_pvalue_manual(quant_plot_dat_pwc, 
+             label = "p.adj.signif",
+             xmin = "xmin", 
+             xmax = "xmax", 
+             hide.ns = T)
+
+
+quant_plot <- quant_plot_dat %>%
+  ggplot(aes(x = day, y = log10(antat_pos_percent), group = interaction(day, space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = .75, outlier.shape = NA) +
+  geom_point(aes(color = tissue), size = 2.5, 
+             position = position_jitterdodge(jitter.width = .1,dodge.width =.75)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Log10(Percent of parasites expressing the starting VSG)") +
+  scale_color_manual(values = color_palette_3_v2) +
+  scale_fill_manual(values = color_palette_2) +
+  #scale_x_continuous(limits = c(5,14), breaks = c(6,13)) +
+  geom_hline(yintercept = -2, linetype = 2) 
+
+quant_plot  
+
+
+ggsave("figures/Facs_starting_quant_plot.pdf", quant_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+
+quant_plot_dat %>%
+  group_by(day, tissue) %>%
+  summarize(avg = mean(antat_pos_ratio)*100)
+```
+
+
+
+
+## Figure 5
+
+```{r}
+# Loading AID-/- sequencing data
+# Data from the first flow cell, which was with some of the WT samples
+AID_raw_results_1 <- read_csv("data/AID data/Beaver_raw_vsg_seq_results_AID_1.csv") %>%
+  vsg_rename("data/cluster_reference_table.txt") %>% 
+  mutate(tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub" ~ "sub",
+                            tissue == "gonfat" ~ "gon",
+                            tissue == "subcu" ~ "sub", 
+                            tissue == "lungs" ~ "lung",
+                            tissue == "GonFat" ~ "gon", 
+                            tissue == "SubCu" ~ "sub",
+                            TRUE ~ tissue)) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+  select(-mode,
+         -...1) 
+
+# Data from the second AID flow cell
+AID_raw_results_2 <- read_csv("data/AID data/Beaver_raw_vsg_seq_results_AID_2.txt") %>%
+  mutate(strain = "AID",
+         experiment = "2") %>% 
+  vsg_rename("data/AID data/AID_cluster_reference_table.txt") %>%
+  mutate(tissue = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "gonadal" ~ "gon. fat",
+                            tissue == "lungs" ~ "lung",
+                            tissue == "sc" ~ "s.c. fat",
+                            tissue == "scfat" ~ "s.c. fat",
+                            TRUE ~ tissue),
+         tissue_final = tissue) %>%
+  mutate(day = toupper(day))
+
+# Combinig all AID VSG seq results 
+AID_raw_results <- rbind(AID_raw_results_1, AID_raw_results_2)
+
+# Filtering out VSGs less than 0.01% of parasites in a sample
+AID_results <- AID_raw_results %>% 
+  filter(Percent > 0.01) %>% 
+  mutate(day = factor(day, levels = c("D6", "D10", "D14"))) %>%
+  group_by(samplename) %>%
+  distinct(cluster, .keep_all = TRUE) %>%
+  ungroup() %>%
+  mutate(mouse_final = paste(mouse, strain, sep = "_"))
+
+AID_results_all_combos <- vsg_expand(AID_results, "samplename", "cluster") %>%
+  separate(samplename, c("mouse", "day", "tissue"), sep = "_", remove = FALSE) %>%
+  mutate(strain = "AID")
+
+# Combining WT and AID data
+wt_results <- results %>%
+  select(-mode, -total_parasites_in_sample, -parasites) %>%
+  mutate(experiment = "1")
+
+wt_results_all_combos <-  vsg_expand(wt_results, "samplename", "cluster") %>%
+  separate(samplename, c("mouse", "day", "tissue"), sep = "_", remove = FALSE) %>%
+  mutate(strain = "WT") %>%
+  anti_join(bad_alignment, by = c("mouse", "tissue"))
+
+wt_and_aid_results <- rbind(AID_results, wt_results)
+
+# Need to create a data frame with all VSGs represented in each sample
+wt_and_aid_results_all_combos <- rbind(AID_results_all_combos, wt_results_all_combos) %>%
+  mutate(tissue = case_when(tissue == "Brain" ~ "brain",
+                            tissue == "Ear" ~ "ear",
+                            tissue == "Gon" ~ "gon",
+                            tissue == "Heart" ~ "heart",
+                            tissue == "Lung" ~ "lung",
+                            tissue == "Sub" ~ "sub",
+                            tissue == "gonfat" ~ "gon",
+                            tissue == "subcu" ~ "sub", 
+                            tissue == "lungs" ~ "lung",
+                            tissue == "GonFat" ~ "gon", 
+                            tissue == "SubCu" ~ "sub",
+                            TRUE ~ tissue)) %>%
+  mutate(tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sub" ~ "s.c. fat",
+                            TRUE ~ tissue))
+```
+
+### A
+
+```{r}
+wt_and_aid_starting_vsgs <- wt_and_aid_results %>%
+  filter(day == "D6", tissue == "blood") %>%
+  vsg_max(mouse) %>%
+  select(mouse, cluster) %>%
+  merge(wt_and_aid_results_all_combos, by = c('mouse','cluster')) %>%
+  mutate(Percent = case_when(Percent < .01 ~ 0,
+                             TRUE~ Percent)) %>%
+  mutate(Percent = Percent + .001) %>%
+  mutate(space = case_when(tissue != "blood" ~ "tissues", 
+                           TRUE ~ tissue)) %>%
+  mutate(strain_space = paste(strain, space, sep = " ")) %>%
+  mutate(strain_space = factor(strain_space, levels = c("WT blood","WT tissues","AID blood","AID tissues"))) %>%
+  mutate(day = toupper(day))
+
+wt_and_aid_starting_vsg_espression <- wt_and_aid_starting_vsgs %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("6","10", "14"))) %>%
+  select(-day1) %>% 
+  filter(day != "D10") %>% 
+  mutate(strain = factor(strain, levels = c("WT", "AID" ))) 
+
+write_csv(wt_and_aid_starting_vsg_espression, "source_data/5a_source.csv")
+
+wt_and_aid_starting_vsg_espression_plot <-wt_and_aid_starting_vsg_espression %>%
+  ggplot(aes(x = day_num_char, y = log10(Percent), group = interaction(day_num_char, space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = .75) +
+  geom_point(aes(color = space), size = 2.5, position = position_jitterdodge(jitter.width = .1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Percent of parasites\nexpressing the starting VSG") +
+  scale_color_manual(values = red_blue) +
+  scale_fill_manual(values = red_blue) +
+  ylim(-3,2) +
+  facet_wrap("strain") +
+  scale_y_continuous(labels = c("n.d.", "0.01%","0.1%", "1%", "10%", "100%")) +
+  geom_hline(yintercept = -2, linetype = 2) 
+
+wt_and_aid_starting_vsg_espression_plot
+ggsave("figures/figure_4A.pdf", wt_and_aid_starting_vsg_espression_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+### B
+
+```{r}
+wt_and_aid_vsg_counts <- wt_and_aid_results %>% 
+  vsg_count(mouse_final, day, tissue, strain) %>% 
+  mutate(space = case_when(tissue != "blood" ~ "tissues", 
+                           TRUE ~ tissue)) %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("6","10", "14"))) %>%
+  select(-day1) %>% 
+  mutate(strain = factor(strain, levels = c("WT", "AID"))) %>%
+  filter(day!= "D10") 
+
+wt_and_aid_counts_norm_test <- wt_and_aid_vsg_counts %>% 
+  filter(day == "D14") %>%
+  group_by(space, strain) %>%
+  shapiro_test(vsg_count)
+
+wt_and_aid_counts_t_test <- wt_and_aid_vsg_counts %>% 
+  filter(day == "D14") %>%
+ # mutate(test = paste(strain, day, space, sep = "_")) %>%
+  group_by(space, day_num_char) %>%
+  pairwise_t_test(vsg_count ~ strain, p.adjust.method = "BH") 
+
+wt_and_aid_vsg_count_plot <- wt_and_aid_vsg_counts %>%
+  ggplot(aes(x = day_num_char, y = vsg_count, group = interaction(day, space))) + 
+  geom_boxplot(aes(fill = space), alpha = .5, width =.75) +
+  geom_point(aes(color = space),size = 2.5, position = position_jitterdodge(.1)) + 
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Number of VSGs") +
+  facet_wrap("strain") +
+  scale_fill_manual(values = red_blue) +
+  scale_color_manual(values = red_blue) + 
+  scale_y_continuous(limits = c(0,275), n.breaks = 7)
+wt_and_aid_vsg_count_plot
+
+ggsave("figures/figure_4B.pdf", wt_and_aid_vsg_count_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+# Supplemental figures
+
+## S.5
+```{r}
+# Loading Elisa data
+IgG_dat <- read_csv("data/elisa_data/BZEX44_09012020_IgG_lower_dilution_R.csv") %>%
+  mutate(ab = "IgG") 
+
+IgG_dat <- IgG_dat %>%
+  separate(Sample.Name, c("day", "mouse", "strain"), sep = "_") %>%
+  filter(!str_detect(day, "STD"),
+         mouse != "Blank") %>%
+  select(mouse, day, strain, ab, Conc_mg.ml) %>%
+  group_by(mouse, day, strain, ab) %>% 
+  summarise(mean_concentraion_mg_ml = mean(Conc_mg.ml))
+  
+
+IgM_dat <- read_csv("data/elisa_data/BZEX44_09042020_IgM_R.csv") %>%
+  mutate(ab = "IgM") 
+
+IgM_dat <- IgM_dat %>%
+  separate(Sample.Name, c("day", "mouse", "strain"), sep = "_") %>%
+  filter(!str_detect(day, "STD")) %>%
+  select(mouse, day, strain, ab, Conc_mg.ml) %>%
+  group_by(mouse, day, strain, ab) %>% 
+  summarise(mean_concentraion_mg_ml = mean(Conc_mg.ml))
+
+# Merge IgG and IgM data
+elisa_dat <- rbind(IgG_dat, IgM_dat)
+
+elisa_plot <- elisa_dat %>%
+  filter(strain == "WT" | strain == "AID") %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  select(-day1) %>%
+  mutate(ab = factor(ab, levels = c("IgM", "IgG"))) %>%
+  ggplot(aes(x = day_num, y = mean_concentraion_mg_ml, color = ab, fill = ab)) +
+  geom_point(position = position_dodge2(1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  facet_wrap("strain") +
+  stat_summary(aes(group=ab),fun=mean,geom="line", size = 1.2) +
+  scale_color_manual(values = red_blue) +
+  scale_fill_manual(values = red_blue) +
+  scale_x_continuous( breaks = c(0,6,10,14)) + 
+  ylab("Concentration of antibody (mg/ml)") +
+  xlab("Time post infection (days)")
+elisa_plot
+ggsave("figures/figure_S5.pdf", elisa_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+## S.3C 
+
+```{r}
+pad1_expression <- read_csv("data/pad1_qpcr_data/pad1_expression.csv") %>%
+  mutate(across(day, str_replace, "d","D"),
+         across(mouse, str_replace, "m","M"),
+         tissue_final = case_when(tissue == "ear" ~ "skin",
+                            tissue == "gon" ~ "gon. fat",
+                            tissue == "sc" ~ "s.c. fat",
+                            TRUE ~ tissue)) %>%
+   mutate(mouse_final = case_when(mouse == "M12" ~ "1", 
+                                 mouse == "M27" ~ "2",
+                                 mouse == "M32" ~ "3",
+                                 mouse == "M33" ~ "4",
+                                 mouse == "M30" ~ "5",
+                                 mouse == "M36" ~ "6",
+                                 mouse == "M4" ~ "7",
+                                 mouse == "M6" ~ "8",
+                                 mouse == "M2" ~ "9",
+                                 mouse == "M34" ~ "10",
+                                 mouse == "M35" ~ "11",
+                                 mouse == "M3" ~ "12")) %>%
+  mutate(mouse_final = as.numeric(mouse_final)) %>%
+  left_join(counts_per_sample)
+
+vsgs_vs_pad1 <- pad1_expression %>%
+  filter(day != "D6") %>%
+  mutate(space = case_when(tissue_final == "blood" ~ "blood", tissue_final != "blood" ~ "tissues")) %>%
+  ggplot(aes(x = log10(relative_pad1_expression), y = vsg_count)) +
+  geom_point(aes(color = tissue_final)) + 
+  geom_smooth( method='lm', color = "black", size = .5)+
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "*`,`~")),
+           label.x.npc = "left") +
+  theme_pubr(legend = "right", base_size = 12) +
+  facet_wrap("space", scales = "fixed") +
+  scale_color_manual(values = color_palette_12) +
+  ylab("Number of VSGs") +
+  xlab("Log10(relative PAD1 expression)")
+vsgs_vs_pad1
+
+ggsave("figures/figure_S3C.pdf",vsgs_vs_pad1,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+## S.6
+
+```{r}
+tsetse_raw_results <- vsg_read("data/tsetse_infection_data/tsetse_all_results.txt")
+
+sg_raw_results <- read_tsv("data/tsetse_infection_data/sg_vsgseq_RESULTS.txt") %>%
+  mutate(mouse = "salivary_gland", day = "sg", tissue = "salivary_gland", samplename = file) %>%
+  select(-file)
+
+tsetse_sg_raw_results <- rbind(tsetse_raw_results, sg_raw_results)
+
+tsetse_results <- vsg_rename(tsetse_raw_results, "data/tsetse_infection_data/cluster_reference_table.txt") %>%
+  filter(mouse != "Undetermined") 
+
+tsetse_results <- tsetse_results %>%
+  filter(Percent > 0.01) %>%
+  mutate(day = factor(day, levels = c("D5", "D10", "D14")))
+```
+
+# 4a
+```{r}
+tsetse_results %>%
+  filter(mouse == "m4",
+         day == "D14") %>%
+  select(cluster) %>%
+  distinct() %>%
+  count()
+
+tsetse_D14_mouse_VSG_counts <- tsetse_results %>%
+  filter(day == "D14") %>%
+  mutate(space = case_when(tissue == 'blood' ~ 'blood only', TRUE ~ 'tissues only')) %>%
+  group_by(space) %>%
+  distinct(cluster, mouse, day) %>%
+  ungroup() %>%
+  group_by(mouse, cluster) %>%
+  add_tally() %>%
+  mutate(space = case_when(n == 2 ~ 'shared', TRUE ~ space)) %>%
+  ungroup() %>% 
+  group_by(mouse, space) %>%
+  distinct(cluster, space) %>%
+  count(name = "VSGs",sort = TRUE) %>%
+  ungroup() %>%
+  group_by(mouse) %>%
+  mutate(total_vsgs = sum(VSGs)) %>%
+  ungroup() %>%
+  mutate(day = "Day 14")
+
+tsetse_D14_mouse_VSG_counts_summary <- tsetse_D14_mouse_VSG_counts %>%
+  mutate(day = factor(day, levels = c("Day 6", "Day 10", "Day 14")),
+         percent_vsgs = (VSGs/total_vsgs)*100) %>%
+  ungroup() %>%
+  group_by(space, mouse) %>%
+  summarize(mean_percent = mean(percent_vsgs)) 
+
+tsetse_D14_mouse_VSG_counts <- tsetse_D14_mouse_VSG_counts %>%
+  mutate(
+         day = factor(day, levels = c("Day 6", "Day 10", "Day 14")),
+         percent_vsgs = (VSGs/total_vsgs)*100) 
+
+write_csv(tsetse_D14_mouse_VSG_counts, "source_data/4a_source.csv")
+
+tsetse_VSGs_count_plot <- tsetse_D14_mouse_VSG_counts %>%
+  ggplot(aes(x = mouse, y = percent_vsgs))+
+  geom_col(aes(fill = space))+
+  facet_wrap("day", scales = "free_x") + 
+  ylab("Percent of VSGs") + 
+  xlab("Mouse") +
+  theme_pubr(base_size = 20, legend = "right") +
+  scale_fill_manual(values = color_palette_3)
+
+tsetse_VSGs_count_plot
+
+ggsave("figures/tsetse_percent_vsgs_by_space.pdf", tsetse_VSGs_count_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+
+```{r}
+tsetse_counts_per_sample <- tsetse_results %>%
+  vsg_count(day, mouse, tissue) %>%
+  mutate(space = case_when(tissue != "blood" ~ "tissues", 
+                           TRUE ~ tissue)) 
+
+tsetse_test_of_normality <- tsetse_counts_per_sample %>% 
+  filter(day == "D14") %>%
+  group_by(space) %>% 
+  shapiro_test(vsg_count)
+
+tsetse_counts_by_space_t_test_dat <- tsetse_counts_per_sample %>%
+  filter(day == "D14") %>%
+  pairwise_t_test(vsg_count ~ space, p.adjust.method = "BH") %>%
+  mutate(xmin = 1,
+         xmax = 2, 
+         y.position = 283) 
+
+tsetse_d14_counts_by_space_plot <- tsetse_counts_per_sample %>%
+  filter(day == "D14") %>%
+  ggplot(aes(x = space, y = vsg_count, group = interaction(day, space))) + 
+  geom_boxplot(aes(fill = space), alpha = .5, width =.75, outlier.size=0) +
+  geom_point(aes(color = space),size = 2.5, position = position_jitterdodge(.1)) + 
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("") +
+  ylab("Number of VSGs") +
+  scale_fill_manual(values = color_palette_12) +
+  scale_color_manual(values = color_palette_12) +
+  add_pvalue(tsetse_counts_by_space_t_test_dat, 
+             label = "p.adj.signif",
+             xmin = "xmin", 
+             xmax = "xmax") +
+  scale_y_continuous(limits = c(0,300))
+tsetse_d14_counts_by_space_plot
+
+ggsave("figures/figure_S6A.pdf", tsetse_d14_counts_by_space_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+```{r}
+tsetse_results_all_combos <- vsg_expand(tsetse_results, "samplename", "cluster") %>%
+  separate(samplename, c("mouse", "day", "`tissue"), sep = "_", remove = FALSE)
+
+tsetse_starting_vsgs <- tsetse_results %>%
+  filter(day  == "D5") %>%
+  vsg_max(mouse) %>%
+  select(mouse, cluster, mouse) %>%
+  merge(tsetse_results_all_combos, by = c('mouse','cluster')) %>%
+  mutate(Percent = case_when(Percent < .01 ~ 0,
+                             TRUE~ Percent)) %>%
+  mutate(Percent = Percent + .001) %>%
+  mutate(day = factor(day, levels = c("D5", "D10", "D14"))) 
+
+tsetse_starting_vsg_espression_dat <- tsetse_starting_vsgs %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("5","10", "14"))) %>%
+  select(-day1) %>% 
+  mutate(space = case_when(tissue == "blood" ~ "blood", 
+                           TRUE ~ "tissues")) %>%
+  mutate(expression = case_when(Percent == .001 ~ "N", 
+                                TRUE ~ "Y"),
+         day = factor(day_num, levels = c("5", "10", "14"))) 
+
+write_csv(tsetse_starting_vsg_espression_dat, "source_data/4c_source.csv")
+
+tsetse_starting_vsg_espression_plot <- tsetse_starting_vsg_espression_dat %>%
+  filter(day != 10) %>%
+  ggplot(aes(x = day, y = log10(Percent), group = interaction(day, space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = 1, outlier.shape = NA) +
+  geom_point(aes(color = tissue), size = 2.5, position =
+               position_jitterdodge(jitter.width = .15, dodge.width = 1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Percent of parasites expressing\nthe most abundat day 5 VSG") +
+  scale_color_manual(values = color_palette_12) +
+  scale_fill_manual(values = color_palette_12) +
+  #ylim(-3,3.1) +
+  geom_hline(yintercept = -2, linetype = 2) +
+  scale_y_continuous(limits = c(-3, 2), labels = c("n.d.", "0.01%","0.1%", 
+                                "1.0%", "10%", "100%")) +
+  guides(color = guide_legend(title = "Tissue"),
+         fill = guide_legend(title = "Space"))
+tsetse_starting_vsg_espression_plot
+
+ggsave("figures/figure_S6B.pdf", tsetse_starting_vsg_espression_plot,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+```{r}
+
+tsetse_sg_raw_results <- rbind(tsetse_raw_results, sg_raw_results)
+
+tsetse_sg_results <- vsg_rename(tsetse_sg_raw_results, "data/tsetse_infection_data/sg_orfs/cluster_reference_table.txt") %>%
+  filter(mouse != "Undetermined") 
+
+tsetse_sg_results <- tsetse_sg_results %>%
+  filter(Percent > 0.01) %>%
+  mutate(day = factor(day, levels = c("sg", "D5", "D10", "D14")))
+
+tsetse_sg_results_all_combos <- vsg_expand(tsetse_sg_results, "samplename", "cluster") %>%
+  separate(samplename, c("mouse", "day", "`tissue"), sep = "_", remove = FALSE)
+
+all_sg_vsgs <- tsetse_sg_results %>% 
+  filter(day == "sg") %>%
+  select(cluster) %>%
+  mutate(sg = "Y")
+
+sgs_percent <- left_join(all_sg_vsgs, tsetse_sg_results) %>%
+  filter(day != "sg") %>%
+  group_by(mouse, day, tissue, sg) %>%
+  summarise(Percent_sg_vsgs=sum(Percent)) %>%
+  separate(day, c("day1","day_num"), sep = "D", convert = TRUE, remove = FALSE) %>%
+  mutate(day_num_char = as.character(day_num)) %>%
+  mutate(day_num_char = factor(day_num_char, levels = c("5","10", "14"))) %>%
+  select(-day1) %>% 
+  mutate(space = case_when(tissue == "blood" ~ "blood", 
+                           TRUE ~ "tissues")) 
+
+write_csv(sgs_percent, "source_data/4d_source.csv")
+
+percent_sg_vsgs <- sgs_percent %>%
+  filter(day != "D10") %>%
+  ggplot(aes(x = day, y = log10(Percent_sg_vsgs), group = interaction(day, space))) +
+  geom_boxplot(aes(fill = space), alpha = .5, width = 1) +
+  geom_point(aes(color = tissue), size = 2.5, position =
+               position_jitterdodge(jitter.width = .1, dodge.width = 1)) +
+  theme_pubr(legend = "right", base_size = 20) +
+  xlab("Time post infection (days)") +
+  ylab("Percent of parasites\nexpressing a mVSG") +
+  scale_color_manual(values = color_palette_12) +
+  scale_fill_manual(values = color_palette_12) +
+  #ylim(-3,3.1) +
+  geom_hline(yintercept = -2, linetype = 2) +
+  scale_y_continuous(limits = c(-3, 2), labels = c("n.d.", "0.01%","0.1%", 
+                                "1.0%", "10%", "100%")) +
+  guides(color = guide_legend(title = "Tissue"),
+         fill = guide_legend(title = "Space"))
+percent_sg_vsgs
+
+ggsave("figures/percent_sg_vsgs.pdf", percent_sg_vsgs,
+       device = "pdf", width = 8, height = 6, units = "in")
+```
+
+# extended data fig 2 
+
+## Testing if there are certain VSGs or VSG motiffs that are preferred within specific tissue niches. (Jill Hakim)
+```{r, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(ggplot2); theme_set(theme_bw())
+library(Biostrings)
+library(cowplot)
+library(RColorBrewer)
+library(ggpubr)
+```
+
+```{r}
+#### Now add the sequence information
+orfs_merged = readDNAStringSet("./AlexData/abex7_all_orfs_merged.merged.fa")
+#turn it into a dataframe for easy merging into datfinal
+orfs_merged_df = orfs_merged %>% 
+  as.data.frame() %>%
+  rownames_to_column() %>% 
+  dplyr::rename(VSG = rowname,
+         consensus_seq = x)
+```
+Read in data from "results"
+```{r}
+#this file has the link btwn the clusters generated using CD hit to the VSG names generated using Trinity
+clusterkey = read.delim("./AlexData/cluster_reference_table.txt", col.names = c("VSG", "cluster"))
+#These are three different sequencing runs of the same thing, all output as the "vsg seq outputs"
+dat1 =read.delim("./AlexData/abex7_fc_1-2_RESULTS.txt") %>% mutate(strain = "WT") %>% mutate(innoculation = "IP")
+dat2 = read.delim("./AlexData/abex7_fc_2_RESULTS.txt") %>% mutate(strain = "WT") %>% mutate(innoculation ="IV")
+dat3 = read.delim("./AlexData/abex7_fc_3_RESULTS.txt") %>% mutate(innoculation = "IV")
+#rbind them and do some cleaning
+dat = rbind(dat1,dat2,dat3) %>% 
+  filter(file !="file")  %>%
+  mutate(tissue = case_when(
+    tissue =="Blood"~ "blood",
+    tissue == "Gon" ~ "gon",
+    tissue == "Gonfat" ~ "gon",
+    tissue == "GonFat" ~"gon",
+    tissue == "gonfat" ~ "gon",
+    tissue =="Heart" ~"heart",
+    tissue == "Ear"~"ear",
+    tissue == "Sub" ~ "sub",
+    tissue == "subcu" ~"sub",
+    tissue == "SubCu"~"sub",
+    tissue == "Lung" ~"lung",
+    tissue == "lungs" ~"lung",
+    tissue == "Brain" ~"brain",
+    TRUE ~ as.character(tissue))) %>% 
+  left_join(clusterkey, by = "VSG") %>% 
+  filter(strain == "WT") %>% 
+  filter(innoculation == "IV") %>% 
+  filter(Percent > 0.01)
+```
+Finally, lets add the results expression data to the sequence data so we have everything in one place
+```{r}
+#First we merge the cluster key to the orf_DF bc each vsg is collapsed into one consensus seq
+clusterkey_seqs= right_join(clusterkey, orfs_merged_df, by = "VSG") 
+datfinal = left_join(dat %>% select(-VSG), clusterkey_seqs, by = "cluster") %>% 
+  mutate(day = factor(day, levels = c("D6", "D10","D14"))) %>% 
+  mutate(cluster = str_replace(cluster, pattern = " ", replacement = "_"))
+#cleaning
+rm(dat1)
+rm(dat2)
+rm(dat3)
+rm(orfs_merged)
+rm(orfs_merged_df)
+rm(dat)
+rm(clusterkey_seqs)
+```
+Translate to the protein, output a fasta file 
+```{r eval=FALSE, include=FALSE}
+#now read file in as a biostrings object 
+orfs_merged_clusters = readDNAStringSet("./cluster_consensus_seqs.fasta")
+#Translate 
+seq_prot = translate(orfs_merged_clusters)
+#output as a fasta so we can do that all vs all blast in bash
+writeXStringSet(seq_prot, "./prot_cluster_consensus.fasta")
+```
+# Look at blast output
+Using the distance matrix from the all vs all blast. We'll try a few methods, % identity and e value just to confirm they look the same
+```{r}
+blast = read.csv("./Blast_outputs/Nvsg_vs_Nvsg.csv", col.names = c("cluster_db","cluster_query","percentid","length","mistmatch","gapopen","qstart","qend", "sstart","send" , "evalue", "bitscore"))
+```
+# VSG uniqueness to each compartment
+```{r}
+#Making the subsectioned VSGs
+###########
+brain_vsg = datfinal %>% 
+  filter(tissue == "brain") %>% select(cluster) 
+heart_vsg = datfinal %>% 
+  filter(tissue == "heart") %>% select(cluster) 
+lung_vsg = datfinal %>% 
+  filter(tissue == "lung") %>% select(cluster) 
+blood_vsg = datfinal %>% 
+  filter(tissue == "blood") %>% select(cluster) 
+ear_vsg = datfinal %>% 
+  filter(tissue == "ear") %>% select(cluster) 
+sub_vsg = datfinal %>% 
+  filter(tissue == "sub") %>% select(cluster) 
+gon_vsg = datfinal %>% 
+  filter(tissue == "gon") %>% select(cluster) 
+###########
+# Remove concordant comparisons
+blast_test = blast %>% 
+  mutate(concordant = ifelse(cluster_query == cluster_db, "SAME", "DIFF")) %>% 
+  filter(concordant != "SAME")
+####
+```
+
+```{r}
+## Null
+blast_test %>% 
+  filter(evalue <=1e-3) %>% 
+  ggplot(aes(x=log(bitscore)))+
+  geom_histogram()+
+  scale_x_log10()+
+  ggtitle("Distribution of bitscore, all compartments") -> pnull
+# 
+tissue_list = datfinal$tissue %>% unique()
+plots_percentid = list()
+#
+for (tissue_num in tissue_list) {
+  #Generate a seires of list of VSGs found in a certain compartment across all mice
+  compartment_vsgs = datfinal %>% 
+  filter(tissue == tissue_num) %>% select(cluster)
+  
+  blast_test %>% 
+  filter(evalue <=1e-3) %>% 
+  filter(cluster_db %in% compartment_vsgs$cluster) %>% 
+  ggplot(aes(x=log(bitscore)))+
+  geom_histogram()+
+  scale_x_log10()+
+  ggtitle(paste0(tissue_num , " ","bitscore")) -> pn
+  
+  plots_percentid[[tissue_num]] <- pn
+}
+## Cowplot version
+plot_grid(pnull, plots_percentid$brain, plots_percentid$ear, plots_percentid$gon, plots_percentid$heart, plots_percentid$lung,
+          plots_percentid$sub, plots_percentid$blood)
+## Null
+blast_cut_df = blast_test %>%   filter(evalue <=1e-3) %>%
+  mutate(log_bitscore = log(bitscore))
+gghistogram(
+    data = blast_cut_df,
+    x ="log_bitscore",
+    xlab = "log(bitscore)",
+    title = "All tissues") -> blast_cut
+tissue_list = datfinal$tissue %>% unique()
+plots_percentid = list()
+# ggpubr version
+for (tissue_num in tissue_list) {
+  #Generate a seires of list of VSGs found in a certain compartment across all mice
+  compartment_vsgs = datfinal %>% 
+  filter(tissue == tissue_num) %>% select(cluster)
+  
+  dat_for_plot = blast_test %>% 
+  filter(evalue <=1e-3) %>% 
+  filter(cluster_db %in% compartment_vsgs$cluster) %>% 
+  mutate(log_bitscore = log(bitscore))
+  
+  gghistogram(
+    data = dat_for_plot,
+    x ="log_bitscore",
+    xlab = "log(bitscore)",
+    title = paste0(tissue_num, " bitscore")
+  ) -> pn
+  
+  plots_percentid[[tissue_num]] <- pn
+}
+## Cowplot version
+plot_grid(blast_cut, plots_percentid$brain, plots_percentid$ear, plots_percentid$gon, plots_percentid$heart, plots_percentid$lung,
+          plots_percentid$sub, plots_percentid$blood)
+```
+
+
+
+```{r, echo = FALSE}
+sessionInfo()
+```
+
+
